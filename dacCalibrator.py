@@ -91,12 +91,48 @@ class SerialWorker(QtCore.QObject):
 
 class DraggableCalibrationGraph(pg.GraphItem):
   pointMoved = QtCore.Signal(int, float, float)
+  dragStateChanged = QtCore.Signal(int, bool)
+  voltageLimitHit = QtCore.Signal()
+  pressureLimitHit = QtCore.Signal()
 
   def __init__(self):
     super().__init__()
     self.data = {}
     self.drag_index = None
-    self.scatter.sigClicked.connect(self._on_click)
+    self.drag_offset = None
+    self.hover_index = None
+    self.max_voltage = 5.0
+    self._drag_hit_voltage_limit = False
+    self._drag_hit_pressure_limit = False
+    self.setAcceptHoverEvents(True)
+
+  def set_max_voltage(self, max_voltage):
+    self.max_voltage = max(0.0, min(5.0, float(max_voltage)))
+
+  def _build_point_brushes(self, count):
+    brushes = []
+    for index in range(count):
+      if self.drag_index == index:
+        brushes.append(pg.mkBrush(70, 190, 90, 220))
+      elif self.hover_index == index:
+        brushes.append(pg.mkBrush(255, 190, 40, 220))
+      else:
+        brushes.append(pg.mkBrush(50, 150, 255, 180))
+    return brushes
+
+  def _extract_point_index(self, point):
+    point_data = point.data()
+    if isinstance(point_data, np.ndarray):
+      if point_data.size == 0:
+        return None
+      return int(point_data.flat[0])
+    return int(point_data)
+
+  def _apply_point_brushes(self):
+    if "pos" not in self.data:
+      return
+    self.data["brush"] = self._build_point_brushes(len(self.data["pos"]))
+    self.setData(**self.data)
 
   def set_points(self, points):
     self.points = [list(point) for point in points]
@@ -109,57 +145,106 @@ class DraggableCalibrationGraph(pg.GraphItem):
       "size": 14,
       "symbol": "o",
       "pxMode": True,
+      "data": list(range(len(pos))),
       "pen": pg.mkPen(width=1),
-      "brush": pg.mkBrush(50, 150, 255, 180)
+      "brush": self._build_point_brushes(len(pos))
     }
     self.setData(**self.data)
 
-  def _on_click(self, plot, points):
-    if points:
-      self.drag_index = points[0].index()
-
-  def mouseDragEvent(self, ev):
-    if self.drag_index is None:
-      ev.ignore()
+  def hoverEvent(self, ev):
+    if self.drag_index is not None:
+      ev.acceptDrags(QtCore.Qt.MouseButton.LeftButton)
       return
 
+    if ev.isExit():
+      next_hover = None
+    else:
+      hovered = self.scatter.pointsAt(ev.pos())
+      next_hover = self._extract_point_index(hovered[0]) if hovered else None
+
+    if next_hover != self.hover_index:
+      self.hover_index = next_hover
+      self._apply_point_brushes()
+
+    ev.acceptDrags(QtCore.Qt.MouseButton.LeftButton)
+
+  def mouseDragEvent(self, ev):
     if ev.button() != QtCore.Qt.MouseButton.LeftButton:
       ev.ignore()
       return
 
     if ev.isStart():
+      clicked_points = self.scatter.pointsAt(ev.buttonDownPos())
+      if not clicked_points:
+        ev.ignore()
+        return
+
+      self.drag_index = self._extract_point_index(clicked_points[0])
+      if self.drag_index is None:
+        ev.ignore()
+        return
+
+      drag_index = self.drag_index
+      self.drag_offset = self.data["pos"][drag_index] - np.array(
+        [ev.buttonDownPos().x(), ev.buttonDownPos().y()],
+        dtype=float
+      )
+      self._drag_hit_voltage_limit = False
+      self._drag_hit_pressure_limit = False
+      self._apply_point_brushes()
+      self.dragStateChanged.emit(drag_index, True)
       ev.accept()
       return
 
     if ev.isFinish():
+      last_drag_index = self.drag_index if self.drag_index is not None else -1
+      if self._drag_hit_voltage_limit:
+        self.voltageLimitHit.emit()
+      if self._drag_hit_pressure_limit:
+        self.pressureLimitHit.emit()
       self.drag_index = None
+      self.drag_offset = None
+      self._drag_hit_voltage_limit = False
+      self._drag_hit_pressure_limit = False
+      self._apply_point_brushes()
+      self.dragStateChanged.emit(last_drag_index, False)
       ev.accept()
+      return
+
+    if self.drag_index is None:
+      ev.ignore()
       return
 
     ev.accept()
 
-    mouse_point = self.getViewBox().mapSceneToView(ev.scenePos())
-    x_value = float(mouse_point.x())
-    y_value = float(mouse_point.y())
+    drag_index = self.drag_index
+    mouse_pos = np.array([ev.pos().x(), ev.pos().y()], dtype=float)
+    next_pos = mouse_pos + self.drag_offset
+    x_value = float(next_pos[0])
+    y_value = float(next_pos[1])
 
-    # Clamp Y to 0-5V
-    y_value = max(0.0, min(5.0, y_value))
+    if self.max_voltage < 5.0 and y_value > self.max_voltage:
+      self._drag_hit_voltage_limit = True
+    # Clamp Y to 0-effective max volts
+    y_value = max(0.0, min(self.max_voltage, y_value))
 
     # Clamp X to keep points ordered
     left_limit = -float("inf")
     right_limit = float("inf")
 
-    if self.drag_index > 0:
-      left_limit = self.points[self.drag_index - 1][0]
-    if self.drag_index < len(self.points) - 1:
-      right_limit = self.points[self.drag_index + 1][0]
+    if drag_index > 0:
+      left_limit = self.points[drag_index - 1][0]
+    if drag_index < len(self.points) - 1:
+      right_limit = self.points[drag_index + 1][0]
 
+    if x_value < left_limit or x_value > right_limit:
+      self._drag_hit_pressure_limit = True
     x_value = max(left_limit, min(right_limit, x_value))
 
-    self.points[self.drag_index][0] = x_value
-    self.points[self.drag_index][1] = y_value
+    self.points[drag_index][0] = x_value
+    self.points[drag_index][1] = y_value
     self.set_points(self.points)
-    self.pointMoved.emit(self.drag_index, x_value, y_value)
+    self.pointMoved.emit(drag_index, x_value, y_value)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -171,6 +256,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.current_pressure = 0.0
     self.min_pressure = 0.0
     self.max_pressure = 100.0
+    self.scale = 1.0
 
     self.curve_points = [
       [0.0, 0.0],
@@ -223,7 +309,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     self.max_value_edit = QtWidgets.QLineEdit(f"{self.max_pressure:.2f}")
 
-    self.apply_range_button = QtWidgets.QPushButton("Apply Range")
+    self.scale_value_edit = QtWidgets.QLineEdit(f"{self.scale:.2f}")
 
     pressure_layout.addWidget(QtWidgets.QLabel("Current Pressure:"), 0, 0)
     pressure_layout.addWidget(self.pressure_value_edit, 0, 1)
@@ -231,7 +317,8 @@ class MainWindow(QtWidgets.QMainWindow):
     pressure_layout.addWidget(self.min_value_edit, 1, 1)
     pressure_layout.addWidget(QtWidgets.QLabel("Max Pressure (manual):"), 2, 0)
     pressure_layout.addWidget(self.max_value_edit, 2, 1)
-    pressure_layout.addWidget(self.apply_range_button, 1, 2, 2, 1)
+    pressure_layout.addWidget(QtWidgets.QLabel("Scale:"), 3, 0)
+    pressure_layout.addWidget(self.scale_value_edit, 3, 1)
 
     splitter = QtWidgets.QSplitter()
     splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
@@ -254,6 +341,9 @@ class MainWindow(QtWidgets.QMainWindow):
     self.curve_line = self.plot_widget.plot([], [], pen=pg.mkPen(width=2))
     self.graph_points = DraggableCalibrationGraph()
     self.graph_points.pointMoved.connect(self.on_graph_point_moved)
+    self.graph_points.dragStateChanged.connect(self.on_graph_drag_state_changed)
+    self.graph_points.voltageLimitHit.connect(self.show_voltage_limit_popup)
+    self.graph_points.pressureLimitHit.connect(self.show_pressure_limit_popup)
     self.plot_widget.addItem(self.graph_points)
 
     table_container = QtWidgets.QWidget()
@@ -278,10 +368,8 @@ class MainWindow(QtWidgets.QMainWindow):
     button_row = QtWidgets.QHBoxLayout()
     table_layout.addLayout(button_row)
 
-    self.send_curve_button = QtWidgets.QPushButton("Send Curve")
-    self.save_eeprom_button = QtWidgets.QPushButton("Save to EEPROM")
-    button_row.addWidget(self.send_curve_button)
-    button_row.addWidget(self.save_eeprom_button)
+    self.save_configuration_button = QtWidgets.QPushButton("Save Configuration")
+    button_row.addWidget(self.save_configuration_button)
 
     self.status_label = QtWidgets.QLabel("Ready")
     main_layout.addWidget(self.status_label)
@@ -289,11 +377,12 @@ class MainWindow(QtWidgets.QMainWindow):
     self.refresh_ports_button.clicked.connect(self.refresh_ports)
     self.connect_button.clicked.connect(self.connect_serial)
     self.disconnect_button.clicked.connect(self.disconnect_serial)
-    self.apply_range_button.clicked.connect(self.apply_pressure_range)
+    self.min_value_edit.textChanged.connect(self.on_range_or_scale_changed)
+    self.max_value_edit.textChanged.connect(self.on_range_or_scale_changed)
+    self.scale_value_edit.textChanged.connect(self.on_range_or_scale_changed)
     self.add_point_button.clicked.connect(self.add_point)
     self.remove_point_button.clicked.connect(self.remove_selected_point)
-    self.send_curve_button.clicked.connect(self.send_curve_to_device)
-    self.save_eeprom_button.clicked.connect(self.save_to_eeprom)
+    self.save_configuration_button.clicked.connect(self.save_configuration)
     self.points_table.itemChanged.connect(self.on_table_item_changed)
 
     self.populate_table()
@@ -326,31 +415,48 @@ class MainWindow(QtWidgets.QMainWindow):
     self.current_pressure = pressure
     self.pressure_value_edit.setText(f"{pressure:.2f}")
 
-  def apply_pressure_range(self):
+  def on_range_or_scale_changed(self):
+    if self._updating_range_fields:
+      return
+
+    previous_scale = self.scale
+
     try:
       min_value = float(self.min_value_edit.text().strip())
       max_value = float(self.max_value_edit.text().strip())
+      scale_value = float(self.scale_value_edit.text().strip())
     except ValueError:
-      self.set_status("Invalid min/max pressure values")
-      self.min_value_edit.setText(f"{self.min_pressure:.2f}")
-      self.max_value_edit.setText(f"{self.max_pressure:.2f}")
       return
 
-    if min_value >= max_value:
-      self.set_status("Min pressure must be less than max pressure")
-      self.min_value_edit.setText(f"{self.min_pressure:.2f}")
-      self.max_value_edit.setText(f"{self.max_pressure:.2f}")
+    if scale_value <= 0:
       return
+
+    next_scale = round(scale_value, 4)
+    scale_changed = abs(next_scale - previous_scale) > 1e-9
+
+    if scale_changed:
+      scale_factor = previous_scale / next_scale
+      for index, point in enumerate(self.curve_points):
+        self.curve_points[index][0] = round(point[0] * scale_factor, 2)
+      self.normalize_pressure_order()
 
     self.min_pressure = round(min_value, 2)
     self.max_pressure = round(max_value, 2)
-    self.min_value_edit.setText(f"{self.min_pressure:.2f}")
-    self.max_value_edit.setText(f"{self.max_pressure:.2f}")
+    self.scale = next_scale
+    self.enforce_voltage_limit()
+    self.populate_table()
     self.refresh_graph()
-    self.set_status("Pressure range updated")
 
   def normalize_pressure_order(self):
     self.curve_points.sort(key=lambda point: point[0])
+
+  def effective_max_voltage(self):
+    return max(0.0, min(5.0, 5.0 * self.scale))
+
+  def enforce_voltage_limit(self):
+    max_voltage = self.effective_max_voltage()
+    for index, point in enumerate(self.curve_points):
+      self.curve_points[index][1] = round(max(0.0, min(max_voltage, point[1])), 2)
 
   def expand_pressure_range_to_points(self):
     if not self.curve_points:
@@ -368,8 +474,10 @@ class MainWindow(QtWidgets.QMainWindow):
     if next_min != self.min_pressure or next_max != self.max_pressure:
       self.min_pressure = next_min
       self.max_pressure = next_max
+      self._updating_range_fields = True
       self.min_value_edit.setText(f"{self.min_pressure:.2f}")
       self.max_value_edit.setText(f"{self.max_pressure:.2f}")
+      self._updating_range_fields = False
 
   def populate_table(self):
     self._building_table = True
@@ -388,6 +496,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     self.points_table.blockSignals(False)
     self._building_table = False
+    self._updating_range_fields = False
 
   def add_point(self):
     row = self.points_table.currentRow()
@@ -465,7 +574,13 @@ class MainWindow(QtWidgets.QMainWindow):
     if column == 0:
       self.curve_points[row][0] = value
     elif column == 1:
-      self.curve_points[row][1] = max(0.0, min(5.0, value))
+      max_voltage = self.effective_max_voltage()
+      if value > max_voltage:
+        self.curve_points[row][1] = round(max_voltage, 2)
+        if max_voltage < 5.0:
+          self.show_voltage_limit_popup()
+      else:
+        self.curve_points[row][1] = max(0.0, value)
 
     self.normalize_pressure_order()
     self.expand_pressure_range_to_points()
@@ -475,9 +590,16 @@ class MainWindow(QtWidgets.QMainWindow):
   def refresh_graph(self):
     x_values = [point[0] for point in self.curve_points]
     y_values = [point[1] for point in self.curve_points]
-    x_padding = max((self.max_pressure - self.min_pressure) * 0.05, 1.0)
-    self.plot_widget.setXRange(self.min_pressure - x_padding, self.max_pressure + x_padding, padding=0.0)
+    view_min = min(self.min_pressure, self.max_pressure)
+    view_max = max(self.min_pressure, self.max_pressure)
+    x_span = view_max - view_min
+    if x_span < 1e-9:
+      x_span = 1.0
+    x_padding = max(x_span * 0.05, 1.0)
+    max_voltage = self.effective_max_voltage()
+    self.plot_widget.setXRange(view_min - x_padding, view_max + x_padding, padding=0.0)
     self.plot_widget.setYRange(0.0, 5.0, padding=0.05)
+    self.graph_points.set_max_voltage(max_voltage)
 
     self.curve_line.setData(x_values, y_values)
     self.graph_points.set_points(self.curve_points)
@@ -487,17 +609,44 @@ class MainWindow(QtWidgets.QMainWindow):
     self.curve_points[index][1] = round(y_value, 2)
     self.expand_pressure_range_to_points()
     self.populate_table()
+    self._set_selected_row(index)
     self.refresh_graph()
 
-  def send_curve_to_device(self):
-    payload = {
-      "points": self.curve_points
-    }
-    line = "SET_CURVE:" + json.dumps(payload["points"])
-    self.serial_worker.send_line(line)
+  def on_graph_drag_state_changed(self, index, dragging):
+    if dragging and 0 <= index < len(self.curve_points):
+      self._set_selected_row(index)
 
-  def save_to_eeprom(self):
-    self.serial_worker.send_line("SAVE")
+  def _set_selected_row(self, row):
+    if row < 0 or row >= self.points_table.rowCount():
+      return
+    if self.points_table.currentRow() == row:
+      return
+    self.points_table.selectRow(row)
+
+  def show_voltage_limit_popup(self):
+    QtWidgets.QMessageBox.information(
+      self,
+      "Scale Limit",
+      f"Voltage is capped at {self.effective_max_voltage():.2f}V by the current scale. Increase scale to allow higher voltage output."
+    )
+
+  def show_pressure_limit_popup(self):
+    QtWidgets.QMessageBox.information(
+      self,
+      "Pressure Limit",
+      "Pressure movement is capped by neighboring points to keep the curve ordered. Move adjacent points first to extend this point's range."
+    )
+
+  def save_configuration(self):
+    payload = {
+      "points": self.curve_points,
+      "scale": self.scale,
+      "min_pressure": self.min_pressure,
+      "max_pressure": self.max_pressure
+    }
+    self.set_status("Configuration prepared")
+    # Serial protocol hookup can be finalized later.
+    # self.serial_worker.send_line("SET_CONFIG:" + json.dumps(payload))
 
   def set_status(self, message):
     self.status_label.setText(message)
