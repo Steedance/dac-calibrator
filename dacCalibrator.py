@@ -160,7 +160,7 @@ class DraggableCalibrationGraph(pg.GraphItem):
       next_hover = None
     else:
       hovered = self.scatter.pointsAt(ev.pos())
-      next_hover = self._extract_point_index(hovered[0]) if hovered else None
+      next_hover = self._extract_point_index(hovered[0]) if hovered.size > 0 else None
 
     if next_hover != self.hover_index:
       self.hover_index = next_hover
