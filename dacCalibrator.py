@@ -1,4 +1,3 @@
-import json
 import sys
 import threading
 import time
@@ -11,8 +10,19 @@ import serial.tools.list_ports
 from PySide6 import QtCore, QtGui, QtWidgets
 
 
+DEBUG_MODE = False
+
+
+def debug_print(message):
+  if not DEBUG_MODE:
+    return
+  timestamp = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
+  print(f"[{timestamp}] {message}", flush=True)
+
+
 class SerialWorker(QtCore.QObject):
-  pressure_received = QtCore.Signal(float)
+  line_received = QtCore.Signal(str)
+  line_sent = QtCore.Signal(str)
   status_changed = QtCore.Signal(str)
   connected_changed = QtCore.Signal(bool)
 
@@ -22,19 +32,38 @@ class SerialWorker(QtCore.QObject):
     self._running = False
     self._thread = None
 
+  def _port_is_open(self):
+    if not self.serial_port:
+      return False
+    if hasattr(self.serial_port, "is_open"):
+      return bool(self.serial_port.is_open)
+    if hasattr(self.serial_port, "isOpen"):
+      try:
+        return bool(self.serial_port.isOpen())
+      except Exception:
+        return False
+    return False
+
+  def is_connected(self):
+    return self._port_is_open()
+
   def connect_port(self, port_name, baud_rate=115200):
     try:
+      debug_print(f"Serial connect requested: port={port_name} baud={baud_rate}")
       self.serial_port = serial.Serial(port_name, baud_rate, timeout=0.1)
       self._running = True
       self._thread = threading.Thread(target=self._read_loop, daemon=True)
       self._thread.start()
+      debug_print(f"Serial connected: {port_name}")
       self.status_changed.emit(f"Connected to {port_name} @ {baud_rate}")
       self.connected_changed.emit(True)
     except Exception as exc:
+      debug_print(f"Serial connect failed: {exc}")
       self.status_changed.emit(f"Connect failed: {exc}")
       self.connected_changed.emit(False)
 
   def disconnect_port(self):
+    debug_print("Serial disconnect requested")
     self._running = False
 
     if self._thread and self._thread.is_alive():
@@ -42,29 +71,33 @@ class SerialWorker(QtCore.QObject):
 
     if self.serial_port:
       try:
-        if self.serial_port.is_open:
+        if self._port_is_open():
           self.serial_port.close()
       except Exception:
         pass
 
     self.serial_port = None
+    debug_print("Serial disconnected")
     self.status_changed.emit("Disconnected")
     self.connected_changed.emit(False)
 
   def send_line(self, line):
-    if not self.serial_port or not self.serial_port.is_open:
+    if not self._port_is_open():
       self.status_changed.emit("Not connected")
       return
 
     try:
       payload = (line.strip() + "\n").encode("utf-8")
       self.serial_port.write(payload)
+      debug_print(f"TX: {line.strip()}")
+      self.line_sent.emit(line.strip())
       self.status_changed.emit(f"Sent: {line}")
     except Exception as exc:
+      debug_print(f"TX failed: {exc}")
       self.status_changed.emit(f"Send failed: {exc}")
 
   def _read_loop(self):
-    while self._running and self.serial_port and self.serial_port.is_open:
+    while self._running and self._port_is_open():
       try:
         raw = self.serial_port.readline()
         if not raw:
@@ -75,17 +108,15 @@ class SerialWorker(QtCore.QObject):
         if not line:
           continue
 
-        if line.startswith("PRESSURE:"):
-          value_text = line.split(":", 1)[1].strip()
-          pressure = float(value_text)
-          self.pressure_received.emit(pressure)
-        else:
-          self.status_changed.emit(f"RX: {line}")
+        debug_print(f"RX: {line}")
+        self.line_received.emit(line)
 
       except Exception as exc:
+        debug_print(f"Read error: {exc}")
         self.status_changed.emit(f"Read error: {exc}")
         break
 
+    debug_print("Read loop ended")
     self.connected_changed.emit(False)
 
 
@@ -309,9 +340,19 @@ class MainWindow(QtWidgets.QMainWindow):
     self.resize(1100, 700)
 
     self.current_pressure = 0.0
+    self.current_voltage = 0.0
     self.min_pressure = 0.0
     self.max_pressure = 100.0
     self.scale = 1.0
+    self.debug_mode = False
+    global DEBUG_MODE
+    DEBUG_MODE = self.debug_mode
+    self._last_status_text = "Ready"
+    self._awaiting_config_save = False
+    self._save_ack_timeout_ms = 2000
+    self._save_ack_timer = QtCore.QTimer(self)
+    self._save_ack_timer.setSingleShot(True)
+    self._save_ack_timer.timeout.connect(self.on_save_ack_timeout)
 
     self.curve_points = [
       {"type": "min", "pressure": 0.0, "voltage": 0.0},
@@ -322,7 +363,8 @@ class MainWindow(QtWidgets.QMainWindow):
     ]
 
     self.serial_worker = SerialWorker()
-    self.serial_worker.pressure_received.connect(self.on_pressure_received)
+    self.serial_worker.line_received.connect(self.on_serial_line)
+    self.serial_worker.line_sent.connect(self.on_serial_line_sent)
     self.serial_worker.status_changed.connect(self.set_status)
     self.serial_worker.connected_changed.connect(self.on_connection_changed)
 
@@ -337,6 +379,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self._build_ui()
     self.refresh_ports()
     self.refresh_graph()
+    self._update_live_readouts()
     self._record_history_state()
 
   def _build_ui(self):
@@ -360,12 +403,22 @@ class MainWindow(QtWidgets.QMainWindow):
     top_row.addWidget(self.connect_button)
     top_row.addWidget(self.disconnect_button)
 
-    pressure_group = QtWidgets.QGroupBox("Live Pressure")
+    pressure_group = QtWidgets.QGroupBox("Live Values")
     pressure_layout = QtWidgets.QGridLayout(pressure_group)
     main_layout.addWidget(pressure_group)
 
     self.pressure_value_edit = QtWidgets.QLineEdit("0.00")
     self.pressure_value_edit.setReadOnly(True)
+    self.voltage_value_edit = QtWidgets.QLineEdit("0.00")
+    self.voltage_value_edit.setReadOnly(True)
+
+    live_font = QtGui.QFont()
+    live_font.setPointSize(16)
+    live_font.setBold(True)
+    self.pressure_value_edit.setFont(live_font)
+    self.voltage_value_edit.setFont(live_font)
+    self.pressure_value_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+    self.voltage_value_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
     self.min_value_edit = QtWidgets.QLineEdit(f"{self.min_pressure:.2f}")
 
@@ -375,12 +428,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     pressure_layout.addWidget(QtWidgets.QLabel("Current Pressure:"), 0, 0)
     pressure_layout.addWidget(self.pressure_value_edit, 0, 1)
+    pressure_layout.addWidget(QtWidgets.QLabel("Current Voltage:"), 0, 2)
+    pressure_layout.addWidget(self.voltage_value_edit, 0, 3)
     pressure_layout.addWidget(QtWidgets.QLabel("Min Pressure (manual):"), 1, 0)
     pressure_layout.addWidget(self.min_value_edit, 1, 1)
-    pressure_layout.addWidget(QtWidgets.QLabel("Max Pressure (manual):"), 2, 0)
-    pressure_layout.addWidget(self.max_value_edit, 2, 1)
-    pressure_layout.addWidget(QtWidgets.QLabel("Scale:"), 3, 0)
-    pressure_layout.addWidget(self.scale_value_edit, 3, 1)
+    pressure_layout.addWidget(QtWidgets.QLabel("Max Pressure (manual):"), 1, 2)
+    pressure_layout.addWidget(self.max_value_edit, 1, 3)
+    pressure_layout.addWidget(QtWidgets.QLabel("Scale:"), 2, 0)
+    pressure_layout.addWidget(self.scale_value_edit, 2, 1)
 
     splitter = QtWidgets.QSplitter()
     splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
@@ -445,12 +500,23 @@ class MainWindow(QtWidgets.QMainWindow):
     self.undo_button = QtWidgets.QPushButton("Undo")
     self.redo_button = QtWidgets.QPushButton("Redo")
     self.save_configuration_button = QtWidgets.QPushButton("Save Configuration")
+    self.save_configuration_button.setEnabled(False)
     button_row.addWidget(self.undo_button)
     button_row.addWidget(self.redo_button)
     button_row.addWidget(self.save_configuration_button)
 
     self.status_label = QtWidgets.QLabel("Ready")
     main_layout.addWidget(self.status_label)
+
+    self.log_group = QtWidgets.QGroupBox("Serial Log")
+    log_layout = QtWidgets.QVBoxLayout(self.log_group)
+    self.serial_log = QtWidgets.QPlainTextEdit()
+    self.serial_log.setReadOnly(True)
+    self.serial_log.setMaximumBlockCount(500)
+    self.serial_log.setMinimumHeight(140)
+    log_layout.addWidget(self.serial_log)
+    main_layout.addWidget(self.log_group)
+    self.log_group.setVisible(self.debug_mode)
 
     self.refresh_ports_button.clicked.connect(self.refresh_ports)
     self.connect_button.clicked.connect(self.connect_serial)
@@ -475,7 +541,16 @@ class MainWindow(QtWidgets.QMainWindow):
     self.port_combo.clear()
     ports = serial.tools.list_ports.comports()
     for port in ports:
-      self.port_combo.addItem(port.device)
+      # pyserial usually returns ListPortInfo, but some environments expose tuples.
+      if hasattr(port, "device"):
+        device_name = port.device
+      elif isinstance(port, (tuple, list)) and len(port) > 0:
+        device_name = str(port[0])
+      else:
+        device_name = str(port)
+
+      if device_name:
+        self.port_combo.addItem(device_name)
 
     if self.port_combo.count() == 0:
       self.port_combo.addItem("No ports found")
@@ -486,18 +561,100 @@ class MainWindow(QtWidgets.QMainWindow):
       self.set_status("No serial port selected")
       return
 
+    debug_print(f"UI connect clicked: {port_name}")
     self.serial_worker.connect_port(port_name)
 
   def disconnect_serial(self):
+    debug_print("UI disconnect clicked")
     self.serial_worker.disconnect_port()
 
   def on_connection_changed(self, connected):
+    debug_print(f"Connection state changed: connected={connected}")
     self.connect_button.setEnabled(not connected)
     self.disconnect_button.setEnabled(connected)
+    self.save_configuration_button.setEnabled(connected and not self._awaiting_config_save)
+    if connected:
+      debug_print("Requesting config from device")
+      self.serial_worker.send_line("GET_CONFIG")
+    else:
+      self._awaiting_config_save = False
+      if self._save_ack_timer.isActive():
+        self._save_ack_timer.stop()
+      self.save_configuration_button.setEnabled(False)
+      self.status_label.setText(self._last_status_text)
 
-  def on_pressure_received(self, pressure):
-    self.current_pressure = pressure
-    self.pressure_value_edit.setText(f"{pressure:.2f}")
+  def on_serial_line(self, line):
+    self.append_serial_log("RX", line)
+    debug_print(f"Processing RX line: {line}")
+    if line.startswith("PRESSURE:"):
+      value_text = line.split(":", 1)[1].strip()
+      try:
+        self.current_pressure = float(int(value_text))
+      except ValueError:
+        self.set_status(f"Bad pressure payload: {value_text}")
+        return
+      self._update_live_readouts()
+      return
+
+    if line.startswith("VOLTS:"):
+      value_text = line.split(":", 1)[1].strip()
+      try:
+        self.current_voltage = float(value_text)
+      except ValueError:
+        self.set_status(f"Bad volts payload: {value_text}")
+        return
+      self._update_live_readouts()
+      return
+
+    if line.startswith("CONFIG|"):
+      if self.apply_config_line(line):
+        self.set_status("Configuration loaded from device")
+      else:
+        self.set_status("Failed to parse device configuration")
+      return
+
+    if line == "CONFIG_SAVED":
+      self._awaiting_config_save = False
+      if self._save_ack_timer.isActive():
+        self._save_ack_timer.stop()
+      self.save_configuration_button.setEnabled(True)
+      QtWidgets.QMessageBox.information(self, "Save Succeeded", "Device acknowledged CONFIG_SAVED.")
+      self.set_status("Configuration saved on device")
+      return
+
+    if line.startswith("ERR:"):
+      if self._awaiting_config_save:
+        self._awaiting_config_save = False
+        if self._save_ack_timer.isActive():
+          self._save_ack_timer.stop()
+        self.save_configuration_button.setEnabled(True)
+        QtWidgets.QMessageBox.warning(self, "Save Failed", line)
+      self.set_status(line)
+      return
+
+    self.set_status(f"RX: {line}")
+
+  def on_serial_line_sent(self, line):
+    self.append_serial_log("TX", line)
+
+  def append_serial_log(self, direction, line):
+    if not self.debug_mode:
+      return
+    timestamp = QtCore.QDateTime.currentDateTime().toString("HH:mm:ss.zzz")
+    self.serial_log.appendPlainText(f"{timestamp} {direction} {line}")
+
+  def _update_live_readouts(self):
+    self.pressure_value_edit.setText(f"{self.current_pressure:.0f}")
+    self.voltage_value_edit.setText(f"{self.current_voltage:.3f}")
+
+  def on_save_ack_timeout(self):
+    if not self._awaiting_config_save:
+      return
+    debug_print("Save ack timeout")
+    self._awaiting_config_save = False
+    self.save_configuration_button.setEnabled(True)
+    QtWidgets.QMessageBox.warning(self, "Save Timeout", "No CONFIG_SAVED ack received from device.")
+    self.set_status("Timed out waiting for CONFIG_SAVED")
 
   def on_range_or_scale_changed(self):
     if self._updating_range_fields or self._restoring_state:
@@ -537,6 +694,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.enforce_voltage_limit()
     self.populate_table()
     self.refresh_graph()
+    self._update_live_readouts()
 
   def on_range_or_scale_edit_finished(self):
     self._record_history_state()
@@ -610,6 +768,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.enforce_voltage_limit()
     self.populate_table()
     self.refresh_graph()
+    self._update_live_readouts()
     self._restoring_state = False
     self._update_history_buttons()
 
@@ -718,6 +877,7 @@ class MainWindow(QtWidgets.QMainWindow):
       self.curve_points.append({"type": "normal", "pressure": 0.0, "voltage": 0.0})
       self.populate_table()
       self.refresh_graph()
+      self._update_live_readouts()
       return
 
     if 0 <= row < point_count - 1:
@@ -750,6 +910,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.populate_table()
     self.points_table.selectRow(insert_index)
     self.refresh_graph()
+    self._update_live_readouts()
     self._record_history_state()
 
   def remove_selected_point(self):
@@ -775,6 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
       self.points_table.selectRow(next_row)
 
     self.refresh_graph()
+    self._update_live_readouts()
     self._record_history_state()
 
   def on_table_item_changed(self, item):
@@ -822,6 +984,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.enforce_voltage_limit()
     self.populate_table()
     self.refresh_graph()
+    self._update_live_readouts()
     self._record_history_state()
 
   def refresh_graph(self):
@@ -867,6 +1030,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.populate_table()
     self._set_selected_row(index)
     self.refresh_graph()
+    self._update_live_readouts()
 
   def on_graph_drag_state_changed(self, index, dragging):
     if dragging and 0 <= index < len(self.curve_points):
@@ -901,18 +1065,114 @@ class MainWindow(QtWidgets.QMainWindow):
       "Pressure movement is capped by neighboring points to keep the curve ordered. Move adjacent points first to extend this point's range."
     )
 
+  def apply_config_line(self, line):
+    debug_print(f"Parsing config line: {line}")
+    parts = [part.strip() for part in line.split("|")]
+    if len(parts) < 5 or parts[0] != "CONFIG":
+      return False
+
+    try:
+      min_pressure = float(int(parts[1]))
+      max_pressure = float(int(parts[2]))
+      scale_milli = int(parts[3])
+      point_count = int(parts[4])
+    except ValueError:
+      return False
+
+    point_fields = parts[5:]
+    if point_count < 2 or point_count != len(point_fields):
+      return False
+    if scale_milli <= 0:
+      return False
+
+    parsed_points = []
+    for idx, pair_text in enumerate(point_fields):
+      if ":" not in pair_text:
+        return False
+      pressure_text, voltage_text = pair_text.split(":", 1)
+      try:
+        pressure_value = float(int(pressure_text.strip()))
+        voltage_mv = int(voltage_text.strip())
+      except ValueError:
+        return False
+      if voltage_mv < 0 or voltage_mv > 5000:
+        return False
+
+      if idx == 0:
+        point_type = "min"
+      elif idx == point_count - 1:
+        point_type = "max"
+      else:
+        point_type = "normal"
+      parsed_points.append(
+        {
+          "type": point_type,
+          "pressure": round(pressure_value, 2),
+          "voltage": round(voltage_mv / 1000.0, 3)
+        }
+      )
+
+    self._restoring_state = True
+    self.curve_points = parsed_points
+    self.min_pressure = round(min_pressure, 2)
+    self.max_pressure = round(max_pressure, 2)
+    self.scale = round(scale_milli / 1000.0, 4)
+
+    self._updating_range_fields = True
+    self.min_value_edit.setText(f"{self.min_pressure:.2f}")
+    self.max_value_edit.setText(f"{self.max_pressure:.2f}")
+    self.scale_value_edit.setText(f"{self.scale:.2f}")
+    self._updating_range_fields = False
+
+    self.normalize_pressure_order()
+    self.enforce_voltage_limit()
+    self.populate_table()
+    self.refresh_graph()
+    self._update_live_readouts()
+    self._restoring_state = False
+    self._record_history_state()
+    debug_print("Config line applied to UI/state")
+    return True
+
+  def build_set_config_line(self):
+    self.normalize_pressure_order()
+    point_count = len(self.curve_points)
+    min_pressure = int(round(self.min_pressure))
+    max_pressure = int(round(self.max_pressure))
+    scale_milli = int(round(self.scale * 1000.0))
+
+    payload = [
+      "SET_CONFIG",
+      str(min_pressure),
+      str(max_pressure),
+      str(scale_milli),
+      str(point_count)
+    ]
+
+    for point in self.curve_points:
+      pressure_raw = int(round(point["pressure"]))
+      volts_mv = int(round(max(0.0, min(5.0, point["voltage"])) * 1000.0))
+      payload.append(f"{pressure_raw}:{volts_mv}")
+
+    line = "|".join(payload)
+    debug_print(f"Built SET_CONFIG payload: {line}")
+    return line
+
   def save_configuration(self):
-    payload = {
-      "points": self.curve_points,
-      "scale": self.scale,
-      "min_pressure": self.min_pressure,
-      "max_pressure": self.max_pressure
-    }
-    self.set_status("Configuration prepared")
-    # Serial protocol hookup can be finalized later.
-    # self.serial_worker.send_line("SET_CONFIG:" + json.dumps(payload))
+    if not self.serial_worker.is_connected():
+      self.set_status("Cannot save: not connected")
+      return
+
+    line = self.build_set_config_line()
+    debug_print("Sending SET_CONFIG and waiting for CONFIG_SAVED")
+    self._awaiting_config_save = True
+    self.save_configuration_button.setEnabled(False)
+    self._save_ack_timer.start(self._save_ack_timeout_ms)
+    self.serial_worker.send_line(line)
+    self.set_status("SET_CONFIG sent, waiting for CONFIG_SAVED")
 
   def set_status(self, message):
+    self._last_status_text = message
     self.status_label.setText(message)
 
   def closeEvent(self, event):
@@ -928,8 +1188,15 @@ def main():
 
   window = MainWindow()
   window.show()
+  exit_code = 0
+  try:
+    exit_code = app.exec()
+  except KeyboardInterrupt:
+    if window.serial_worker.is_connected():
+      window.serial_worker.disconnect_port()
+    exit_code = 0
 
-  sys.exit(app.exec())
+  sys.exit(exit_code)
 
 
 if __name__ == "__main__":
