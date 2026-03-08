@@ -98,10 +98,14 @@ class DraggableCalibrationGraph(pg.GraphItem):
   def __init__(self):
     super().__init__()
     self.data = {}
+    self.points = []
     self.drag_index = None
     self.drag_offset = None
+    self.drag_start_mouse_x = None
+    self.drag_start_pressure = None
     self.hover_index = None
     self.max_voltage = 5.0
+    self.endpoint_drag_sensitivity = 0.5
     self._drag_hit_voltage_limit = False
     self._drag_hit_pressure_limit = False
     self.setAcceptHoverEvents(True)
@@ -112,12 +116,20 @@ class DraggableCalibrationGraph(pg.GraphItem):
   def _build_point_brushes(self, count):
     brushes = []
     for index in range(count):
+      point_type = self.points[index]["type"]
+      if point_type == "min":
+        base_brush = pg.mkBrush(220, 70, 70, 210)
+      elif point_type == "max":
+        base_brush = pg.mkBrush(190, 60, 220, 210)
+      else:
+        base_brush = pg.mkBrush(50, 150, 255, 180)
+
       if self.drag_index == index:
         brushes.append(pg.mkBrush(70, 190, 90, 220))
       elif self.hover_index == index:
         brushes.append(pg.mkBrush(255, 190, 40, 220))
       else:
-        brushes.append(pg.mkBrush(50, 150, 255, 180))
+        brushes.append(base_brush)
     return brushes
 
   def _extract_point_index(self, point):
@@ -135,15 +147,30 @@ class DraggableCalibrationGraph(pg.GraphItem):
     self.setData(**self.data)
 
   def set_points(self, points):
-    self.points = [list(point) for point in points]
+    self.points = [
+      {
+        "pressure": float(point["pressure"]),
+        "voltage": float(point["voltage"]),
+        "type": str(point["type"])
+      }
+      for point in points
+    ]
     pos = []
-    for x_value, y_value in self.points:
-      pos.append((float(x_value), float(y_value)))
+    symbols = []
+    sizes = []
+    for point in self.points:
+      pos.append((point["pressure"], point["voltage"]))
+      if point["type"] == "normal":
+        symbols.append("o")
+        sizes.append(14)
+      else:
+        symbols.append("t")
+        sizes.append(18)
 
     self.data = {
       "pos": np.array(pos, dtype=float),
-      "size": 14,
-      "symbol": "o",
+      "size": sizes,
+      "symbol": symbols,
       "pxMode": True,
       "data": list(range(len(pos))),
       "pen": pg.mkPen(width=1),
@@ -189,6 +216,8 @@ class DraggableCalibrationGraph(pg.GraphItem):
         [ev.buttonDownPos().x(), ev.buttonDownPos().y()],
         dtype=float
       )
+      self.drag_start_mouse_x = float(ev.buttonDownPos().x())
+      self.drag_start_pressure = float(self.points[drag_index]["pressure"])
       self._drag_hit_voltage_limit = False
       self._drag_hit_pressure_limit = False
       self._apply_point_brushes()
@@ -204,6 +233,8 @@ class DraggableCalibrationGraph(pg.GraphItem):
         self.pressureLimitHit.emit()
       self.drag_index = None
       self.drag_offset = None
+      self.drag_start_mouse_x = None
+      self.drag_start_pressure = None
       self._drag_hit_voltage_limit = False
       self._drag_hit_pressure_limit = False
       self._apply_point_brushes()
@@ -222,10 +253,13 @@ class DraggableCalibrationGraph(pg.GraphItem):
     next_pos = mouse_pos + self.drag_offset
     x_value = float(next_pos[0])
     y_value = float(next_pos[1])
+    point_type = self.points[drag_index]["type"]
+    voltage_limit_hit = False
+    pressure_limit_hit = False
 
     if self.max_voltage < 5.0 and y_value > self.max_voltage:
-      self._drag_hit_voltage_limit = True
-    # Clamp Y to 0-effective max volts
+      voltage_limit_hit = True
+    # Clamp Y to 0-effective max volts.
     y_value = max(0.0, min(self.max_voltage, y_value))
 
     # Clamp X to keep points ordered
@@ -233,16 +267,37 @@ class DraggableCalibrationGraph(pg.GraphItem):
     right_limit = float("inf")
 
     if drag_index > 0:
-      left_limit = self.points[drag_index - 1][0]
+      left_limit = self.points[drag_index - 1]["pressure"]
     if drag_index < len(self.points) - 1:
-      right_limit = self.points[drag_index + 1][0]
+      right_limit = self.points[drag_index + 1]["pressure"]
 
-    if x_value < left_limit or x_value > right_limit:
-      self._drag_hit_pressure_limit = True
-    x_value = max(left_limit, min(right_limit, x_value))
+    if point_type == "min":
+      if self.drag_start_mouse_x is not None and self.drag_start_pressure is not None:
+        delta_x = float(ev.pos().x()) - self.drag_start_mouse_x
+        x_value = self.drag_start_pressure + delta_x * self.endpoint_drag_sensitivity
+      if drag_index < len(self.points) - 1:
+        right_limit = self.points[drag_index + 1]["pressure"]
+      if x_value > right_limit:
+        pressure_limit_hit = True
+      x_value = min(x_value, right_limit)
+    elif point_type == "max":
+      if self.drag_start_mouse_x is not None and self.drag_start_pressure is not None:
+        delta_x = float(ev.pos().x()) - self.drag_start_mouse_x
+        x_value = self.drag_start_pressure + delta_x * self.endpoint_drag_sensitivity
+      if drag_index > 0:
+        left_limit = self.points[drag_index - 1]["pressure"]
+      if x_value < left_limit:
+        pressure_limit_hit = True
+      x_value = max(x_value, left_limit)
+    else:
+      if x_value < left_limit or x_value > right_limit:
+        pressure_limit_hit = True
+      x_value = max(left_limit, min(right_limit, x_value))
 
-    self.points[drag_index][0] = x_value
-    self.points[drag_index][1] = y_value
+    self._drag_hit_voltage_limit = voltage_limit_hit
+    self._drag_hit_pressure_limit = pressure_limit_hit
+    self.points[drag_index]["pressure"] = x_value
+    self.points[drag_index]["voltage"] = y_value
     self.set_points(self.points)
     self.pointMoved.emit(drag_index, x_value, y_value)
 
@@ -259,11 +314,11 @@ class MainWindow(QtWidgets.QMainWindow):
     self.scale = 1.0
 
     self.curve_points = [
-      [0.0, 0.0],
-      [25.0, 1.25],
-      [50.0, 2.5],
-      [75.0, 3.75],
-      [100.0, 5.0]
+      {"type": "min", "pressure": 0.0, "voltage": 0.0},
+      {"type": "normal", "pressure": 25.0, "voltage": 1.25},
+      {"type": "normal", "pressure": 50.0, "voltage": 2.5},
+      {"type": "normal", "pressure": 75.0, "voltage": 3.75},
+      {"type": "max", "pressure": 100.0, "voltage": 5.0}
     ]
 
     self.serial_worker = SerialWorker()
@@ -346,6 +401,18 @@ class MainWindow(QtWidgets.QMainWindow):
     graph_layout.addWidget(self.plot_widget)
 
     self.curve_line = self.plot_widget.plot([], [], pen=pg.mkPen(width=2))
+    self.min_pressure_line = pg.InfiniteLine(
+      angle=90,
+      movable=False,
+      pen=pg.mkPen(color=(220, 70, 70, 180), width=1.5, style=QtCore.Qt.PenStyle.DashLine)
+    )
+    self.max_pressure_line = pg.InfiniteLine(
+      angle=90,
+      movable=False,
+      pen=pg.mkPen(color=(190, 60, 220, 180), width=1.5, style=QtCore.Qt.PenStyle.DashLine)
+    )
+    self.plot_widget.addItem(self.min_pressure_line)
+    self.plot_widget.addItem(self.max_pressure_line)
     self.graph_points = DraggableCalibrationGraph()
     self.graph_points.pointMoved.connect(self.on_graph_point_moved)
     self.graph_points.dragStateChanged.connect(self.on_graph_drag_state_changed)
@@ -358,8 +425,8 @@ class MainWindow(QtWidgets.QMainWindow):
     splitter.addWidget(table_container)
 
     self.points_table = QtWidgets.QTableWidget()
-    self.points_table.setColumnCount(2)
-    self.points_table.setHorizontalHeaderLabels(["Pressure", "Voltage"])
+    self.points_table.setColumnCount(3)
+    self.points_table.setHorizontalHeaderLabels(["Type", "Pressure", "Voltage"])
     self.points_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
     self.points_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
     self.points_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -453,13 +520,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     if scale_changed:
       scale_factor = previous_scale / next_scale
-      for index, point in enumerate(self.curve_points):
-        self.curve_points[index][0] = round(point[0] * scale_factor, 2)
-      self.normalize_pressure_order()
+      for point in self.curve_points:
+        if point["type"] == "normal":
+          point["pressure"] = round(point["pressure"] * scale_factor, 2)
 
     self.min_pressure = round(min_value, 2)
     self.max_pressure = round(max_value, 2)
     self.scale = next_scale
+    self.normalize_pressure_order()
+
+    if scale_changed:
+      max_index = self._find_point_index("max")
+      if max_index >= 0:
+        self.curve_points[max_index]["voltage"] = round(self.effective_max_voltage(), 2)
+
     self.enforce_voltage_limit()
     self.populate_table()
     self.refresh_graph()
@@ -469,7 +543,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
   def _capture_state(self):
     return {
-      "curve_points": [[float(x), float(y)] for x, y in self.curve_points],
+      "curve_points": [
+        {
+          "type": str(point["type"]),
+          "pressure": float(point["pressure"]),
+          "voltage": float(point["voltage"])
+        }
+        for point in self.curve_points
+      ],
       "min_pressure": float(self.min_pressure),
       "max_pressure": float(self.max_pressure),
       "scale": float(self.scale)
@@ -507,7 +588,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
   def _apply_state(self, state):
     self._restoring_state = True
-    self.curve_points = [[float(x), float(y)] for x, y in state["curve_points"]]
+    self.curve_points = [
+      {
+        "type": str(point["type"]),
+        "pressure": float(point["pressure"]),
+        "voltage": float(point["voltage"])
+      }
+      for point in state["curve_points"]
+    ]
     self.min_pressure = float(state["min_pressure"])
     self.max_pressure = float(state["max_pressure"])
     self.scale = float(state["scale"])
@@ -518,6 +606,8 @@ class MainWindow(QtWidgets.QMainWindow):
     self.scale_value_edit.setText(f"{self.scale:.2f}")
     self._updating_range_fields = False
 
+    self.normalize_pressure_order()
+    self.enforce_voltage_limit()
     self.populate_table()
     self.refresh_graph()
     self._restoring_state = False
@@ -535,52 +625,86 @@ class MainWindow(QtWidgets.QMainWindow):
     self._history_index += 1
     self._apply_state(self._history[self._history_index])
 
+  def _find_point_index(self, point_type):
+    for index, point in enumerate(self.curve_points):
+      if point["type"] == point_type:
+        return index
+    return -1
+
+  def _sync_endpoint_points(self):
+    min_index = self._find_point_index("min")
+    max_index = self._find_point_index("max")
+
+    if min_index < 0:
+      self.curve_points.append({"type": "min", "pressure": self.min_pressure, "voltage": 0.0})
+      min_index = len(self.curve_points) - 1
+    if max_index < 0:
+      self.curve_points.append({"type": "max", "pressure": self.max_pressure, "voltage": 5.0})
+      max_index = len(self.curve_points) - 1
+
+    self.curve_points[min_index]["pressure"] = round(self.min_pressure, 2)
+    self.curve_points[max_index]["pressure"] = round(self.max_pressure, 2)
+
   def normalize_pressure_order(self):
-    self.curve_points.sort(key=lambda point: point[0])
+    self._sync_endpoint_points()
+    min_point = next(point for point in self.curve_points if point["type"] == "min")
+    max_point = next(point for point in self.curve_points if point["type"] == "max")
+    normal_points = [point for point in self.curve_points if point["type"] == "normal"]
+
+    left_bound = min(min_point["pressure"], max_point["pressure"])
+    right_bound = max(min_point["pressure"], max_point["pressure"])
+
+    for point in normal_points:
+      point["pressure"] = round(max(left_bound, min(right_bound, point["pressure"])), 2)
+
+    normal_points.sort(key=lambda point: point["pressure"])
+    self.curve_points = [min_point] + normal_points + [max_point]
 
   def effective_max_voltage(self):
-    return max(0.0, min(5.0, 5.0 * self.scale))
+    if self.scale <= 0:
+      return 0.0
+    return max(0.0, min(5.0, 5.0 / self.scale))
 
   def enforce_voltage_limit(self):
     max_voltage = self.effective_max_voltage()
-    for index, point in enumerate(self.curve_points):
-      self.curve_points[index][1] = round(max(0.0, min(max_voltage, point[1])), 2)
+    for point in self.curve_points:
+      point["voltage"] = round(max(0.0, min(max_voltage, point["voltage"])), 2)
 
   def expand_pressure_range_to_points(self):
-    if not self.curve_points:
-      return
-
-    x_values = [point[0] for point in self.curve_points]
-    next_min = self.min_pressure
-    next_max = self.max_pressure
-
-    if min(x_values) < next_min:
-      next_min = round(min(x_values), 2)
-    if max(x_values) > next_max:
-      next_max = round(max(x_values), 2)
-
-    if next_min != self.min_pressure or next_max != self.max_pressure:
-      self.min_pressure = next_min
-      self.max_pressure = next_max
-      self._updating_range_fields = True
-      self.min_value_edit.setText(f"{self.min_pressure:.2f}")
-      self.max_value_edit.setText(f"{self.max_pressure:.2f}")
-      self._updating_range_fields = False
+    self.normalize_pressure_order()
 
   def populate_table(self):
     self._building_table = True
     self.points_table.blockSignals(True)
     self.points_table.setRowCount(len(self.curve_points))
 
-    for row_index, (pressure, voltage) in enumerate(self.curve_points):
-      pressure_item = QtWidgets.QTableWidgetItem(f"{pressure:.2f}")
-      voltage_item = QtWidgets.QTableWidgetItem(f"{voltage:.2f}")
+    type_labels = {"min": "Min", "max": "Max", "normal": "Point"}
+    type_backgrounds = {
+      "min": QtGui.QColor(255, 230, 230),
+      "max": QtGui.QColor(245, 230, 255),
+      "normal": QtGui.QColor(235, 245, 255)
+    }
 
+    for row_index, point in enumerate(self.curve_points):
+      point_type = point["type"]
+      type_item = QtWidgets.QTableWidgetItem(type_labels.get(point_type, "Point"))
+      pressure_item = QtWidgets.QTableWidgetItem(f"{point['pressure']:.2f}")
+      voltage_item = QtWidgets.QTableWidgetItem(f"{point['voltage']:.2f}")
+
+      type_item.setFlags(type_item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+
+      point_background = type_backgrounds.get(point_type, type_backgrounds["normal"])
+      type_item.setBackground(point_background)
+      pressure_item.setBackground(point_background)
+      voltage_item.setBackground(point_background)
+
+      type_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
       pressure_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
       voltage_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
-      self.points_table.setItem(row_index, 0, pressure_item)
-      self.points_table.setItem(row_index, 1, voltage_item)
+      self.points_table.setItem(row_index, 0, type_item)
+      self.points_table.setItem(row_index, 1, pressure_item)
+      self.points_table.setItem(row_index, 2, voltage_item)
 
     self.points_table.blockSignals(False)
     self._building_table = False
@@ -591,7 +715,7 @@ class MainWindow(QtWidgets.QMainWindow):
     point_count = len(self.curve_points)
 
     if point_count < 2:
-      self.curve_points.append([0.0, 0.0])
+      self.curve_points.append({"type": "normal", "pressure": 0.0, "voltage": 0.0})
       self.populate_table()
       self.refresh_graph()
       return
@@ -611,16 +735,16 @@ class MainWindow(QtWidgets.QMainWindow):
       left = self.curve_points[0]
       right = self.curve_points[1]
       for idx in range(point_count - 1):
-        gap = self.curve_points[idx + 1][0] - self.curve_points[idx][0]
+        gap = self.curve_points[idx + 1]["pressure"] - self.curve_points[idx]["pressure"]
         if gap > largest_gap:
           largest_gap = gap
           left = self.curve_points[idx]
           right = self.curve_points[idx + 1]
           insert_index = idx + 1
 
-    new_x = round((left[0] + right[0]) / 2.0, 2)
-    new_y = round((left[1] + right[1]) / 2.0, 2)
-    self.curve_points.insert(insert_index, [new_x, new_y])
+    new_x = round((left["pressure"] + right["pressure"]) / 2.0, 2)
+    new_y = round((left["voltage"] + right["voltage"]) / 2.0, 2)
+    self.curve_points.insert(insert_index, {"type": "normal", "pressure": new_x, "voltage": new_y})
     self.expand_pressure_range_to_points()
 
     self.populate_table()
@@ -629,13 +753,18 @@ class MainWindow(QtWidgets.QMainWindow):
     self._record_history_state()
 
   def remove_selected_point(self):
-    if len(self.curve_points) <= 2:
-      self.set_status("At least two points are required")
-      return
-
     row = self.points_table.currentRow()
     if row < 0 or row >= len(self.curve_points):
       self.set_status("Select a row to remove")
+      return
+
+    if self.curve_points[row]["type"] in ("min", "max"):
+      self.set_status("Min and Max points cannot be removed")
+      return
+
+    normal_count = sum(1 for point in self.curve_points if point["type"] == "normal")
+    if normal_count <= 1:
+      self.set_status("At least one normal point is required")
       return
 
     del self.curve_points[row]
@@ -654,6 +783,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     row = item.row()
     column = item.column()
+    point_type = self.curve_points[row]["type"]
 
     try:
       value = float(item.text())
@@ -662,25 +792,41 @@ class MainWindow(QtWidgets.QMainWindow):
       return
 
     if column == 0:
-      self.curve_points[row][0] = value
-    elif column == 1:
+      self.populate_table()
+      return
+
+    if column == 1:
+      if point_type == "min":
+        self.min_pressure = round(value, 2)
+        self._updating_range_fields = True
+        self.min_value_edit.setText(f"{self.min_pressure:.2f}")
+        self._updating_range_fields = False
+      elif point_type == "max":
+        self.max_pressure = round(value, 2)
+        self._updating_range_fields = True
+        self.max_value_edit.setText(f"{self.max_pressure:.2f}")
+        self._updating_range_fields = False
+      else:
+        self.curve_points[row]["pressure"] = value
+    elif column == 2:
       max_voltage = self.effective_max_voltage()
       if value > max_voltage:
-        self.curve_points[row][1] = round(max_voltage, 2)
+        self.curve_points[row]["voltage"] = round(max_voltage, 2)
         if max_voltage < 5.0:
           self.show_voltage_limit_popup()
       else:
-        self.curve_points[row][1] = max(0.0, value)
+        self.curve_points[row]["voltage"] = max(0.0, value)
 
     self.normalize_pressure_order()
     self.expand_pressure_range_to_points()
+    self.enforce_voltage_limit()
     self.populate_table()
     self.refresh_graph()
     self._record_history_state()
 
   def refresh_graph(self):
-    x_values = [point[0] for point in self.curve_points]
-    y_values = [point[1] for point in self.curve_points]
+    x_values = [point["pressure"] for point in self.curve_points]
+    y_values = [point["voltage"] for point in self.curve_points]
     view_min = min(self.min_pressure, self.max_pressure)
     view_max = max(self.min_pressure, self.max_pressure)
     x_span = view_max - view_min
@@ -691,14 +837,33 @@ class MainWindow(QtWidgets.QMainWindow):
     self.plot_widget.setXRange(view_min - x_padding, view_max + x_padding, padding=0.0)
     self.plot_widget.setYRange(0.0, 5.0, padding=0.05)
     self.graph_points.set_max_voltage(max_voltage)
+    self.min_pressure_line.setValue(self.min_pressure)
+    self.max_pressure_line.setValue(self.max_pressure)
 
     self.curve_line.setData(x_values, y_values)
     self.graph_points.set_points(self.curve_points)
 
   def on_graph_point_moved(self, index, x_value, y_value):
-    self.curve_points[index][0] = round(x_value, 2)
-    self.curve_points[index][1] = round(y_value, 2)
+    point_type = self.curve_points[index]["type"]
+    rounded_x = round(x_value, 2)
+    rounded_y = round(y_value, 2)
+
+    self.curve_points[index]["pressure"] = rounded_x
+    self.curve_points[index]["voltage"] = rounded_y
+
+    if point_type == "min":
+      self.min_pressure = rounded_x
+      self._updating_range_fields = True
+      self.min_value_edit.setText(f"{self.min_pressure:.2f}")
+      self._updating_range_fields = False
+    elif point_type == "max":
+      self.max_pressure = rounded_x
+      self._updating_range_fields = True
+      self.max_value_edit.setText(f"{self.max_pressure:.2f}")
+      self._updating_range_fields = False
+
     self.expand_pressure_range_to_points()
+    self.enforce_voltage_limit()
     self.populate_table()
     self._set_selected_row(index)
     self.refresh_graph()
