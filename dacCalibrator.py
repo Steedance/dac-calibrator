@@ -272,10 +272,17 @@ class MainWindow(QtWidgets.QMainWindow):
     self.serial_worker.connected_changed.connect(self.on_connection_changed)
 
     self._building_table = False
+    self._updating_range_fields = False
+    self._restoring_state = False
+    self._drag_start_state = None
+    self._history = []
+    self._history_index = -1
+    self._history_limit = 25
 
     self._build_ui()
     self.refresh_ports()
     self.refresh_graph()
+    self._record_history_state()
 
   def _build_ui(self):
     central = QtWidgets.QWidget()
@@ -368,7 +375,11 @@ class MainWindow(QtWidgets.QMainWindow):
     button_row = QtWidgets.QHBoxLayout()
     table_layout.addLayout(button_row)
 
+    self.undo_button = QtWidgets.QPushButton("Undo")
+    self.redo_button = QtWidgets.QPushButton("Redo")
     self.save_configuration_button = QtWidgets.QPushButton("Save Configuration")
+    button_row.addWidget(self.undo_button)
+    button_row.addWidget(self.redo_button)
     button_row.addWidget(self.save_configuration_button)
 
     self.status_label = QtWidgets.QLabel("Ready")
@@ -380,12 +391,18 @@ class MainWindow(QtWidgets.QMainWindow):
     self.min_value_edit.textChanged.connect(self.on_range_or_scale_changed)
     self.max_value_edit.textChanged.connect(self.on_range_or_scale_changed)
     self.scale_value_edit.textChanged.connect(self.on_range_or_scale_changed)
+    self.min_value_edit.editingFinished.connect(self.on_range_or_scale_edit_finished)
+    self.max_value_edit.editingFinished.connect(self.on_range_or_scale_edit_finished)
+    self.scale_value_edit.editingFinished.connect(self.on_range_or_scale_edit_finished)
     self.add_point_button.clicked.connect(self.add_point)
     self.remove_point_button.clicked.connect(self.remove_selected_point)
+    self.undo_button.clicked.connect(self.undo_change)
+    self.redo_button.clicked.connect(self.redo_change)
     self.save_configuration_button.clicked.connect(self.save_configuration)
     self.points_table.itemChanged.connect(self.on_table_item_changed)
 
     self.populate_table()
+    self._update_history_buttons()
 
   def refresh_ports(self):
     self.port_combo.clear()
@@ -416,7 +433,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.pressure_value_edit.setText(f"{pressure:.2f}")
 
   def on_range_or_scale_changed(self):
-    if self._updating_range_fields:
+    if self._updating_range_fields or self._restoring_state:
       return
 
     previous_scale = self.scale
@@ -446,6 +463,77 @@ class MainWindow(QtWidgets.QMainWindow):
     self.enforce_voltage_limit()
     self.populate_table()
     self.refresh_graph()
+
+  def on_range_or_scale_edit_finished(self):
+    self._record_history_state()
+
+  def _capture_state(self):
+    return {
+      "curve_points": [[float(x), float(y)] for x, y in self.curve_points],
+      "min_pressure": float(self.min_pressure),
+      "max_pressure": float(self.max_pressure),
+      "scale": float(self.scale)
+    }
+
+  def _states_equal(self, left_state, right_state):
+    return left_state == right_state
+
+  def _update_history_buttons(self):
+    if not hasattr(self, "undo_button") or not hasattr(self, "redo_button"):
+      return
+    self.undo_button.setEnabled(self._history_index > 0)
+    self.redo_button.setEnabled(self._history_index < len(self._history) - 1)
+
+  def _record_history_state(self):
+    if self._restoring_state:
+      return
+
+    state = self._capture_state()
+
+    if self._history_index >= 0 and self._states_equal(state, self._history[self._history_index]):
+      self._update_history_buttons()
+      return
+
+    if self._history_index < len(self._history) - 1:
+      self._history = self._history[:self._history_index + 1]
+
+    self._history.append(state)
+    if len(self._history) > self._history_limit:
+      overflow = len(self._history) - self._history_limit
+      self._history = self._history[overflow:]
+
+    self._history_index = len(self._history) - 1
+    self._update_history_buttons()
+
+  def _apply_state(self, state):
+    self._restoring_state = True
+    self.curve_points = [[float(x), float(y)] for x, y in state["curve_points"]]
+    self.min_pressure = float(state["min_pressure"])
+    self.max_pressure = float(state["max_pressure"])
+    self.scale = float(state["scale"])
+
+    self._updating_range_fields = True
+    self.min_value_edit.setText(f"{self.min_pressure:.2f}")
+    self.max_value_edit.setText(f"{self.max_pressure:.2f}")
+    self.scale_value_edit.setText(f"{self.scale:.2f}")
+    self._updating_range_fields = False
+
+    self.populate_table()
+    self.refresh_graph()
+    self._restoring_state = False
+    self._update_history_buttons()
+
+  def undo_change(self):
+    if self._history_index <= 0:
+      return
+    self._history_index -= 1
+    self._apply_state(self._history[self._history_index])
+
+  def redo_change(self):
+    if self._history_index >= len(self._history) - 1:
+      return
+    self._history_index += 1
+    self._apply_state(self._history[self._history_index])
 
   def normalize_pressure_order(self):
     self.curve_points.sort(key=lambda point: point[0])
@@ -538,6 +626,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.populate_table()
     self.points_table.selectRow(insert_index)
     self.refresh_graph()
+    self._record_history_state()
 
   def remove_selected_point(self):
     if len(self.curve_points) <= 2:
@@ -557,6 +646,7 @@ class MainWindow(QtWidgets.QMainWindow):
       self.points_table.selectRow(next_row)
 
     self.refresh_graph()
+    self._record_history_state()
 
   def on_table_item_changed(self, item):
     if self._building_table:
@@ -586,6 +676,7 @@ class MainWindow(QtWidgets.QMainWindow):
     self.expand_pressure_range_to_points()
     self.populate_table()
     self.refresh_graph()
+    self._record_history_state()
 
   def refresh_graph(self):
     x_values = [point[0] for point in self.curve_points]
@@ -614,7 +705,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
   def on_graph_drag_state_changed(self, index, dragging):
     if dragging and 0 <= index < len(self.curve_points):
+      self._drag_start_state = self._capture_state()
       self._set_selected_row(index)
+      return
+
+    if not dragging and self._drag_start_state is not None:
+      end_state = self._capture_state()
+      if not self._states_equal(self._drag_start_state, end_state):
+        self._record_history_state()
+      self._drag_start_state = None
 
   def _set_selected_row(self, row):
     if row < 0 or row >= self.points_table.rowCount():
